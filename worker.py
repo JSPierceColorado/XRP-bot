@@ -22,12 +22,12 @@ from coinbase.rest import RESTClient
 PRODUCT_ID        = os.getenv("PRODUCT_ID", "XRP-USD")
 GRANULARITY       = os.getenv("GRANULARITY", "ONE_MINUTE")
 RSI_LEN           = int(os.getenv("RSI_LEN", "14"))
-RSI_BUY_THRESH    = float(os.getenv("RSI_BUY_THRESH", "30"))
+RSI_BUY_THRESH    = float(os.getenv("RSI_BUY_THRESH", "24"))
 CANDLES_LIMIT     = int(os.getenv("CANDLES_LIMIT", "200"))
 
 # Order params
 ALLOCATION_PCT    = float(os.getenv("ALLOCATION_PCT", "0.05"))   # 5% of quote balance
-TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "0.02"))  # +2%
+TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "0.03"))  # +2%
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "0.99"))    # 99% below entry (very wide)
 COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MINUTES", "0"))
 BAR_ALIGN_OFFSET  = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))
