@@ -28,7 +28,7 @@ GRANULARITY       = os.getenv("GRANULARITY", "FIFTEEN_MINUTE")   # 15m bars
 RSI_LEN           = int(os.getenv("RSI_LEN", "14"))
 RSI_BUY_THRESH    = float(os.getenv("RSI_BUY_THRESH", "30"))     # entry if RSI < 30
 
-# Trend filter (simple MAs, no displacement)
+# Trend filter (simple MAs)
 MA_FAST_LEN       = int(os.getenv("MA_FAST_LEN", "60"))
 MA_SLOW_LEN       = int(os.getenv("MA_SLOW_LEN", "240"))
 
@@ -41,21 +41,14 @@ COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MINUTES", "0"))      # optional post
 BAR_ALIGN_OFFSET  = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))  # wait a few seconds after bar close
 LOG_PREFIX        = os.getenv("LOG_PREFIX", "[xrp-rsi-bot]")
 
+# Coinbase candle-window constraint: number of candles in [start, end) must be < 350
+# We'll cap the single-call fetch to 300 closed candles.
+CANDLES_LIMIT     = int(os.getenv("CANDLES_LIMIT", "300"))
+
 GRAN_SECONDS = {
     "ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900, "THIRTY_MINUTE": 1800,
     "ONE_HOUR": 3600, "TWO_HOUR": 7200, "FOUR_HOUR": 14400, "SIX_HOUR": 21600, "ONE_DAY": 86400,
 }
-
-def required_bars() -> int:
-    """
-    Minimum history required for the indicators on the latest CLOSED bar.
-    Add a cushion for stability.
-    """
-    need = max(MA_SLOW_LEN, MA_FAST_LEN, RSI_LEN + 1)
-    return need + 60  # small cushion
-
-# Allow override via env; otherwise ensure ample history
-CANDLES_LIMIT     = int(os.getenv("CANDLES_LIMIT", str(max(400, required_bars()))))
 
 # ====== Globals ======
 client = RESTClient()  # needs COINBASE_API_KEY / COINBASE_API_SECRET env
@@ -147,21 +140,31 @@ def latest_price(pid: str) -> Decimal:
 
 def fetch_candles(pid: str, granularity: str, limit: int):
     """
-    Return CLOSED candles oldest->newest.
-    Uses Coinbase Advanced Trade GET /products/{product_id}/candles.
+    Return CLOSED candles oldest->newest in a single request, staying <350 bars.
+    We cap `limit` at 300 to respect Coinbase's window rule and add no extra padding.
     """
     seconds = GRAN_SECONDS.get(granularity, 60)
-    end = int(time.time())
-    start = end - seconds * (limit + 10)
+    bars = max(1, min(int(limit), 300))  # hard cap to avoid 350+ error
+
+    now = time.time()
+    # Align to last CLOSED bar start
+    last_closed_start = math.floor(now / seconds) * seconds - seconds
+
+    # Build a window with exactly `bars` bars ending at the last closed bar.
+    end = int(last_closed_start + seconds)     # exclusive-style top
+    start = end - bars * seconds               # start so that we span `bars` bars
+
     res = client.get(
         f"/api/v3/brokerage/products/{pid}/candles",
-        params={"start": str(start), "end": str(end), "granularity": granularity, "limit": limit},
+        params={"start": str(start), "end": str(end), "granularity": granularity, "limit": bars},
     )
     cands = res["candles"] if isinstance(res, dict) else res.candles
+
+    # Normalize and sort oldest -> newest, filter to CLOSED bars only
     def c_start(c): return int(c["start"]) if isinstance(c, dict) else int(c.start)
     cands = sorted(cands, key=c_start)
-    cutoff = end - seconds  # last closed bar start
-    return [c for c in cands if c_start(c) <= cutoff]
+    candles_closed = [c for c in cands if c_start(c) <= last_closed_start]
+    return candles_closed
 
 # ====== Order flow: market buy WITH attached TP/SL bracket ======
 def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float, sl_pct: float):
@@ -236,7 +239,8 @@ def should_buy(closes: List[float]) -> bool:
     slow = sma(closes, MA_SLOW_LEN)
 
     # Log details for visibility
-    log(f"{PRODUCT_ID} | 15m RSI{RSI_LEN}={r_closed:.2f} | SMA{MA_FAST_LEN}={fast:.6f} < SMA{MA_SLOW_LEN}={slow:.6f}? {fast < slow if not math.isnan(fast) and not math.isnan(slow) else 'nan'}")
+    cmp_txt = (fast < slow) if (not math.isnan(fast) and not math.isnan(slow)) else None
+    log(f"{PRODUCT_ID} | 15m RSI{RSI_LEN}={r_closed:.2f} | SMA{MA_FAST_LEN}={fast:.6f} < SMA{MA_SLOW_LEN}={slow:.6f}? {cmp_txt}")
 
     if math.isnan(r_closed) or math.isnan(fast) or math.isnan(slow):
         return False
