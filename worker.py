@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Perpetual XRP RSI bot — buys when 1m RSI(14) <= threshold and
-submits a MARKET BUY with an attached TP/SL bracket (TP +2%, SL -99%).
-Logs are plain prints for Railway.
+Perpetual XRP RSI+Trend bot — Every 15 minutes, buys when:
+  - RSI(14) < 30, and
+  - SMA(60) < SMA(240)
+Executes a MARKET BUY with an attached TP/SL bracket:
+  - Take profit +5% (limit)
+  - Stop loss -99% (stop trigger)
 
-Relies on Coinbase Advanced Trade API (attached_order_configuration.trigger_bracket_gtc).
+Logs are plain prints (suited for Railway).
+Relies on Coinbase Advanced Trade API + TriggerBracketGTC.
 """
 
 import os
@@ -20,24 +24,38 @@ from coinbase.rest import RESTClient
 
 # ====== Config via env ======
 PRODUCT_ID        = os.getenv("PRODUCT_ID", "XRP-USD")
-GRANULARITY       = os.getenv("GRANULARITY", "ONE_MINUTE")
+GRANULARITY       = os.getenv("GRANULARITY", "FIFTEEN_MINUTE")   # 15m bars
 RSI_LEN           = int(os.getenv("RSI_LEN", "14"))
-RSI_BUY_THRESH    = float(os.getenv("RSI_BUY_THRESH", "24"))
-CANDLES_LIMIT     = int(os.getenv("CANDLES_LIMIT", "200"))
+RSI_BUY_THRESH    = float(os.getenv("RSI_BUY_THRESH", "30"))     # entry if RSI < 30
+
+# Trend filter (simple MAs, no displacement)
+MA_FAST_LEN       = int(os.getenv("MA_FAST_LEN", "60"))
+MA_SLOW_LEN       = int(os.getenv("MA_SLOW_LEN", "240"))
 
 # Order params
 ALLOCATION_PCT    = float(os.getenv("ALLOCATION_PCT", "0.05"))   # 5% of quote balance
-TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "0.03"))  # +2%
+TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))  # +5% TP
 STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "0.99"))    # 99% below entry (very wide)
-COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MINUTES", "0"))
-BAR_ALIGN_OFFSET  = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))
 
+COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MINUTES", "0"))      # optional post-fill cooldown
+BAR_ALIGN_OFFSET  = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))  # wait a few seconds after bar close
 LOG_PREFIX        = os.getenv("LOG_PREFIX", "[xrp-rsi-bot]")
 
 GRAN_SECONDS = {
     "ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900, "THIRTY_MINUTE": 1800,
     "ONE_HOUR": 3600, "TWO_HOUR": 7200, "FOUR_HOUR": 14400, "SIX_HOUR": 21600, "ONE_DAY": 86400,
 }
+
+def required_bars() -> int:
+    """
+    Minimum history required for the indicators on the latest CLOSED bar.
+    Add a cushion for stability.
+    """
+    need = max(MA_SLOW_LEN, MA_FAST_LEN, RSI_LEN + 1)
+    return need + 60  # small cushion
+
+# Allow override via env; otherwise ensure ample history
+CANDLES_LIMIT     = int(os.getenv("CANDLES_LIMIT", str(max(400, required_bars()))))
 
 # ====== Globals ======
 client = RESTClient()  # needs COINBASE_API_KEY / COINBASE_API_SECRET env
@@ -58,7 +76,7 @@ signal.signal(signal.SIGINT, _handle)
 
 def _get(obj, key, default=None):
     if hasattr(obj, key):
-        return getattr(obj, key)
+        return getattr(obj, key, default)
     if isinstance(obj, dict):
         return obj.get(key, default)
     return default
@@ -73,17 +91,18 @@ def _get_in(obj, path, default=None):
 
 # ====== Indicators ======
 def rsi(values: List[float], length: int = 14) -> float:
+    """Wilder's RSI on the provided series (oldest->newest)."""
     if len(values) < length + 1:
         return float("nan")
     gains = losses = 0.0
     for i in range(1, length + 1):
-        d = values[i] - values[i-1]
+        d = values[i] - values[i - 1]
         gains  += max(d, 0.0)
         losses += max(-d, 0.0)
     avg_gain = gains / length
     avg_loss = losses / length
     for i in range(length + 1, len(values)):
-        d = values[i] - values[i-1]
+        d = values[i] - values[i - 1]
         gain = max(d, 0.0)
         loss = max(-d, 0.0)
         avg_gain = (avg_gain * (length - 1) + gain) / length
@@ -92,6 +111,12 @@ def rsi(values: List[float], length: int = 14) -> float:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
+
+def sma(values: List[float], length: int) -> float:
+    """Simple moving average of the last `length` values (latest closed bar)."""
+    if length <= 0 or len(values) < length:
+        return float("nan")
+    return sum(values[-length:]) / length
 
 # ====== Coinbase helpers ======
 def get_product_meta(pid: str) -> Dict[str, Decimal]:
@@ -121,7 +146,10 @@ def latest_price(pid: str) -> Decimal:
     return Decimal(prod.price)
 
 def fetch_candles(pid: str, granularity: str, limit: int):
-    """Return CLOSED candles oldest->newest."""
+    """
+    Return CLOSED candles oldest->newest.
+    Uses Coinbase Advanced Trade GET /products/{product_id}/candles.
+    """
     seconds = GRAN_SECONDS.get(granularity, 60)
     end = int(time.time())
     start = end - seconds * (limit + 10)
@@ -139,10 +167,9 @@ def fetch_candles(pid: str, granularity: str, limit: int):
 def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float, sl_pct: float):
     """
     Create a MARKET buy (IOC) with an attached TriggerBracketGTC:
-    - TP at +tp_pct (limit)
-    - SL at -sl_pct (stop trigger)
-    Per Coinbase docs: only TriggerBracketGtc is eligible for attached orders,
-    and the attached order size is inherited (omit size in the bracket). :contentReference[oaicite:1]{index=1}
+      - TP at +tp_pct (limit)
+      - SL at -sl_pct (stop trigger)
+    Attached order size is inherited from the parent (omit size in the bracket).
     """
     meta = get_product_meta(pid)
     quote_bal = get_quote_available(meta["quote_ccy"])
@@ -170,7 +197,7 @@ def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float
         "product_id": pid,
         "side": "BUY",
         "order_configuration": {
-            "market_market_ioc": {  # market IOC is fine here
+            "market_market_ioc": {  # market IOC
                 "quote_size": f"{qs.normalize():f}"
             }
         },
@@ -183,7 +210,7 @@ def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float
         }
     }
 
-    log(f"{pid} | BUY market ~{qs} {meta['quote_ccy']} w/ attached TP={tp_px} SL={sl_px}")
+    log(f"{pid} | BUY market ~{qs} {meta['quote_ccy']} with TP={tp_px} (+{int(tp_pct*100)}%), SL={sl_px} (-{int(sl_pct*100)}%)")
     resp = client.post("/api/v3/brokerage/orders", data=payload)
 
     success = _get(resp, "success", True)
@@ -200,8 +227,20 @@ def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float
     log(f"{pid} | Parent order_id={oid} (bracket attached)")
 
 # ====== Entry rule & timing ======
-def should_buy(rsi_val: float) -> bool:
-    return rsi_val <= RSI_BUY_THRESH
+def should_buy(closes: List[float]) -> bool:
+    """
+    Entry only when RSI(14) < 30 AND SMA(60) < SMA(240) on the latest CLOSED bar.
+    """
+    r_closed = rsi(closes, RSI_LEN)
+    fast = sma(closes, MA_FAST_LEN)
+    slow = sma(closes, MA_SLOW_LEN)
+
+    # Log details for visibility
+    log(f"{PRODUCT_ID} | 15m RSI{RSI_LEN}={r_closed:.2f} | SMA{MA_FAST_LEN}={fast:.6f} < SMA{MA_SLOW_LEN}={slow:.6f}? {fast < slow if not math.isnan(fast) and not math.isnan(slow) else 'nan'}")
+
+    if math.isnan(r_closed) or math.isnan(fast) or math.isnan(slow):
+        return False
+    return (r_closed < RSI_BUY_THRESH) and (fast < slow)
 
 def sleep_until_next_closed_bar(seconds_per_bar: int, offset: int = 5):
     now = time.time()
@@ -213,8 +252,10 @@ def sleep_until_next_closed_bar(seconds_per_bar: int, offset: int = 5):
 # ====== Main loop ======
 def main():
     global _last_buy_time
-    log(f"Starting XRP RSI bot (RSI{RSI_LEN}≤{RSI_BUY_THRESH} → market buy {ALLOCATION_PCT:.0%} with attached TP +{int(TAKE_PROFIT_PCT*100)}%, SL {int(STOP_LOSS_PCT*100)}% below)")
-    seconds = GRAN_SECONDS.get(GRANULARITY, 60)
+    log(f"Starting XRP RSI+Trend bot (15m, RSI{RSI_LEN}< {RSI_BUY_THRESH}, SMA{MA_FAST_LEN}<SMA{MA_SLOW_LEN} → buy {ALLOCATION_PCT:.0%} with TP +{int(TAKE_PROFIT_PCT*100)}%, SL {int(STOP_LOSS_PCT*100)}% below)")
+    seconds = GRAN_SECONDS.get(GRANULARITY, 900)
+
+    # Meta once at start (helps surface increments/quote ccy early)
     try:
         meta = get_product_meta(PRODUCT_ID)
         log(f"{PRODUCT_ID} | increments price={meta['price_inc']} base={meta['base_inc']} quote={meta['quote_inc']} quote_ccy={meta['quote_ccy']}")
@@ -222,17 +263,18 @@ def main():
         log(f"Product meta error: {e}")
         return
 
+    # Align to next closed 15m bar (+ small offset to ensure closure)
     sleep_until_next_closed_bar(seconds, BAR_ALIGN_OFFSET)
 
     while not _shutting_down:
         try:
             candles = fetch_candles(PRODUCT_ID, GRANULARITY, CANDLES_LIMIT)
             closes = [float(c["close"]) if isinstance(c, dict) else float(c.close) for c in candles]
-            r_closed = rsi(closes, RSI_LEN)
-            price = latest_price(PRODUCT_ID)
-            log(f"{PRODUCT_ID} | 1m RSI{RSI_LEN}(closed)={r_closed:.2f} | price={price}")
 
-            can_buy = should_buy(r_closed)
+            # Decision
+            can_buy = should_buy(closes)
+
+            # Optional cooldown
             if COOLDOWN_MIN > 0 and can_buy and _last_buy_time is not None:
                 if datetime.now(timezone.utc) - _last_buy_time < timedelta(minutes=COOLDOWN_MIN):
                     can_buy = False
@@ -245,6 +287,7 @@ def main():
         except Exception as e:
             log(f"Error: {e}")
 
+        # Sleep to next 15m closed bar (plus small offset)
         sleep_until_next_closed_bar(seconds, BAR_ALIGN_OFFSET)
 
 if __name__ == "__main__":
