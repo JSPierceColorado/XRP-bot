@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """
-Perpetual XRP RSI+Trend bot — Every 15 minutes, buys when:
+Perpetual XRP RSI+Trend bot — Every 15 minutes:
+
+BUY when (15m):
   - RSI(14) < 30, and
   - SMA(60) < SMA(240)
-Executes a MARKET BUY with an attached TP/SL bracket:
-  - Take profit +5% (limit)
-  - Stop loss -99% (stop trigger)
+Executes a MARKET BUY (no bracket).
+
+SELL when (cross-timeframe):
+  - RSI(14) >= 70, and
+  - SMA60 (15m) > SMA60 (1h)
+Executes a MARKET SELL of 5% of available XRP (configurable).
 
 Logs are plain prints (suited for Railway).
-Relies on Coinbase Advanced Trade API + TriggerBracketGTC.
+Relies on Coinbase Advanced Trade API.
 """
 
 import os
@@ -27,22 +32,25 @@ PRODUCT_ID        = os.getenv("PRODUCT_ID", "XRP-USD")
 GRANULARITY       = os.getenv("GRANULARITY", "FIFTEEN_MINUTE")   # 15m bars
 RSI_LEN           = int(os.getenv("RSI_LEN", "14"))
 RSI_BUY_THRESH    = float(os.getenv("RSI_BUY_THRESH", "30"))     # entry if RSI < 30
+RSI_SELL_THRESH   = float(os.getenv("RSI_SELL_THRESH", "70"))     # exit if RSI >= 70
 
-# Trend filter (simple MAs)
+# Trend filters (15m buy uses 60 vs 240; sell uses 15m 60 vs 1h 60)
 MA_FAST_LEN       = int(os.getenv("MA_FAST_LEN", "60"))
 MA_SLOW_LEN       = int(os.getenv("MA_SLOW_LEN", "240"))
 
 # Order params
-ALLOCATION_PCT    = float(os.getenv("ALLOCATION_PCT", "0.05"))   # 5% of quote balance
-TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))  # +5% TP
-STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "0.99"))    # 99% below entry (very wide)
+ALLOCATION_PCT     = float(os.getenv("ALLOCATION_PCT", "0.05"))   # 5% of quote balance (buy)
+SELL_ALLOCATION_PCT= float(os.getenv("SELL_ALLOCATION_PCT", "0.05"))  # 5% of base balance (sell)
 
-COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MINUTES", "0"))      # optional post-fill cooldown
+# Deprecated by design change (kept for backwards compat; not used now)
+TAKE_PROFIT_PCT   = float(os.getenv("TAKE_PROFIT_PCT", "0.05"))  # UNUSED
+STOP_LOSS_PCT     = float(os.getenv("STOP_LOSS_PCT", "0.99"))    # UNUSED
+
+COOLDOWN_MIN      = int(os.getenv("COOLDOWN_MINUTES", "0"))      # optional post-buy cooldown
 BAR_ALIGN_OFFSET  = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))  # wait a few seconds after bar close
 LOG_PREFIX        = os.getenv("LOG_PREFIX", "[xrp-rsi-bot]")
 
 # Coinbase candle-window constraint: number of candles in [start, end) must be < 350
-# We'll cap the single-call fetch to 300 closed candles.
 CANDLES_LIMIT     = int(os.getenv("CANDLES_LIMIT", "300"))
 
 GRAN_SECONDS = {
@@ -118,6 +126,7 @@ def get_product_meta(pid: str) -> Dict[str, Decimal]:
         "price_inc": Decimal(p.price_increment),
         "base_inc":  Decimal(p.base_increment),
         "quote_inc": Decimal(p.quote_increment),
+        "base_ccy":  p.base_currency_id,
         "quote_ccy": p.quote_currency_id,
         "quote_min": Decimal(getattr(p, "quote_min_size", "0")) if hasattr(p, "quote_min_size") else Decimal("0"),
     }
@@ -131,6 +140,13 @@ def get_quote_available(quote_ccy: str) -> Decimal:
     accs = client.get_accounts()
     for a in accs.accounts:
         if a.currency == quote_ccy:
+            return Decimal(a.available_balance["value"])
+    return Decimal("0")
+
+def get_base_available(base_ccy: str) -> Decimal:
+    accs = client.get_accounts()
+    for a in accs.accounts:
+        if a.currency == base_ccy:
             return Decimal(a.available_balance["value"])
     return Decimal("0")
 
@@ -166,34 +182,23 @@ def fetch_candles(pid: str, granularity: str, limit: int):
     candles_closed = [c for c in cands if c_start(c) <= last_closed_start]
     return candles_closed
 
-# ====== Order flow: market buy WITH attached TP/SL bracket ======
-def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float, sl_pct: float):
-    """
-    Create a MARKET buy (IOC) with an attached TriggerBracketGTC:
-      - TP at +tp_pct (limit)
-      - SL at -sl_pct (stop trigger)
-    Attached order size is inherited from the parent (omit size in the bracket).
-    """
+# ====== Order flow (no bracket) ======
+def place_market_buy(pid: str, allocation_pct: float):
+    """Create a MARKET BUY (IOC) sized by % of quote balance. No attached TP/SL."""
     meta = get_product_meta(pid)
     quote_bal = get_quote_available(meta["quote_ccy"])
     if quote_bal <= 0:
-        log(f"{pid} | No {meta['quote_ccy']} available; skipping.")
+        log(f"{pid} | No {meta['quote_ccy']} available; skipping BUY.")
         return
 
-    # Notional & rounding
     quote_notional = Decimal(str(allocation_pct)) * quote_bal
     if meta["quote_min"] and quote_notional < meta["quote_min"]:
-        log(f"{pid} | Notional {quote_notional} < quote_min {meta['quote_min']}; skipping.")
+        log(f"{pid} | Notional {quote_notional} < quote_min {meta['quote_min']}; skipping BUY.")
         return
     qs = round_to_inc(quote_notional, meta["quote_inc"])
     if qs <= 0:
-        log(f"{pid} | Quote size rounds to 0; skipping.")
+        log(f"{pid} | Quote size rounds to 0; skipping BUY.")
         return
-
-    # Compute bracket prices from current price (market order → use latest)
-    px = latest_price(pid)
-    tp_px = round_to_inc(px * Decimal(1 + tp_pct), meta["price_inc"])
-    sl_px = round_to_inc(px * Decimal(1 - sl_pct), meta["price_inc"])  # 99% below entry proxy
 
     payload = {
         "client_order_id": str(uuid.uuid4()),
@@ -203,48 +208,79 @@ def place_market_buy_with_bracket(pid: str, allocation_pct: float, tp_pct: float
             "market_market_ioc": {  # market IOC
                 "quote_size": f"{qs.normalize():f}"
             }
-        },
-        "attached_order_configuration": {
-            "trigger_bracket_gtc": {
-                # omit size; inherits parent size
-                "limit_price": f"{tp_px.normalize():f}",          # take-profit
-                "stop_trigger_price": f"{sl_px.normalize():f}"    # stop (very low)
+        }
+    }
+    log(f"{pid} | BUY market ~{qs} {meta['quote_ccy']}")
+    resp = client.post("/api/v3/brokerage/orders", data=payload)
+    success = _get(resp, "success", True)
+    if not success:
+        log(f"{pid} | BUY failed: {_get(resp, 'error_response')}")
+        return
+    oid = (_get_in(resp, ["success_response", "order_id"]) or
+           _get_in(resp, ["success_response", "orderId"]) or
+           _get(resp, "order_id") or _get(resp, "orderId"))
+    log(f"{pid} | BUY order_id={oid}")
+
+def place_market_sell_base_pct(pid: str, base_pct: float):
+    """Create a MARKET SELL (IOC) sized by % of available base (XRP)."""
+    meta = get_product_meta(pid)
+    base_bal = get_base_available(meta["base_ccy"])
+    if base_bal <= 0:
+        log(f"{pid} | No {meta['base_ccy']} available; skipping SELL.")
+        return
+
+    base_size = round_to_inc(Decimal(str(base_pct)) * base_bal, meta["base_inc"])
+    if base_size <= 0:
+        log(f"{pid} | Base size rounds to 0; skipping SELL.")
+        return
+
+    payload = {
+        "client_order_id": str(uuid.uuid4()),
+        "product_id": pid,
+        "side": "SELL",
+        "order_configuration": {
+            "market_market_ioc": {  # market IOC
+                "base_size": f"{base_size.normalize():f}"
             }
         }
     }
-
-    log(f"{pid} | BUY market ~{qs} {meta['quote_ccy']} with TP={tp_px} (+{int(tp_pct*100)}%), SL={sl_px} (-{int(sl_pct*100)}%)")
+    log(f"{pid} | SELL market ~{base_size} {meta['base_ccy']}")
     resp = client.post("/api/v3/brokerage/orders", data=payload)
-
     success = _get(resp, "success", True)
     if not success:
-        log(f"{pid} | Create order failed: {_get(resp, 'error_response')}")
+        log(f"{pid} | SELL failed: {_get(resp, 'error_response')}")
         return
+    oid = (_get_in(resp, ["success_response", "order_id"]) or
+           _get_in(resp, ["success_response", "orderId"]) or
+           _get(resp, "order_id") or _get(resp, "orderId"))
+    log(f"{pid} | SELL order_id={oid}")
 
-    oid = (
-        _get_in(resp, ["success_response", "order_id"]) or
-        _get_in(resp, ["success_response", "orderId"]) or
-        _get(resp, "order_id") or
-        _get(resp, "orderId")
-    )
-    log(f"{pid} | Parent order_id={oid} (bracket attached)")
+# ====== Entry/Exit rules ======
+def should_buy_15m(closes_15m: List[float]) -> bool:
+    """BUY when RSI(14) < 30 AND SMA(60) < SMA(240) on latest CLOSED 15m bar."""
+    r_closed = rsi(closes_15m, RSI_LEN)
+    fast = sma(closes_15m, MA_FAST_LEN)
+    slow = sma(closes_15m, MA_SLOW_LEN)
 
-# ====== Entry rule & timing ======
-def should_buy(closes: List[float]) -> bool:
-    """
-    Entry only when RSI(14) < 30 AND SMA(60) < SMA(240) on the latest CLOSED bar.
-    """
-    r_closed = rsi(closes, RSI_LEN)
-    fast = sma(closes, MA_FAST_LEN)
-    slow = sma(closes, MA_SLOW_LEN)
-
-    # Log details for visibility
     cmp_txt = (fast < slow) if (not math.isnan(fast) and not math.isnan(slow)) else None
-    log(f"{PRODUCT_ID} | 15m RSI{RSI_LEN}={r_closed:.2f} | SMA{MA_FAST_LEN}={fast:.6f} < SMA{MA_SLOW_LEN}={slow:.6f}? {cmp_txt}")
+    log(f"{PRODUCT_ID} | BUY chk | 15m RSI{RSI_LEN}={r_closed:.2f} | SMA{MA_FAST_LEN}={fast:.6f} < SMA{MA_SLOW_LEN}={slow:.6f}? {cmp_txt}")
 
     if math.isnan(r_closed) or math.isnan(fast) or math.isnan(slow):
         return False
     return (r_closed < RSI_BUY_THRESH) and (fast < slow)
+
+def should_sell_cross_tf(closes_15m: List[float], closes_1h: List[float]) -> bool:
+    """SELL when RSI(14) >= 70 AND SMA60(15m) > SMA60(1h)."""
+    r_closed = rsi(closes_15m, RSI_LEN)
+    ma_15m = sma(closes_15m, MA_FAST_LEN)
+    ma_1h  = sma(closes_1h,  MA_FAST_LEN)
+
+    cmp_txt = (ma_15m > ma_1h) if (not math.isnan(ma_15m) and not math.isnan(ma_1h)) else None
+    log(f"{PRODUCT_ID} | SELL chk | 15m RSI{RSI_LEN}={r_closed:.2f} | SMA60(15m)={ma_15m:.6f} > SMA60(1h)={ma_1h:.6f}? {cmp_txt}")
+
+    if math.isnan(r_closed) or math.isnan(ma_15m) or math.isnan(ma_1h):
+        return False
+    return (r_closed >= RSI_SELL_THRESH) and (ma_15m > ma_1h)
 
 def sleep_until_next_closed_bar(seconds_per_bar: int, offset: int = 5):
     now = time.time()
@@ -256,43 +292,55 @@ def sleep_until_next_closed_bar(seconds_per_bar: int, offset: int = 5):
 # ====== Main loop ======
 def main():
     global _last_buy_time
-    log(f"Starting XRP RSI+Trend bot (15m, RSI{RSI_LEN}< {RSI_BUY_THRESH}, SMA{MA_FAST_LEN}<SMA{MA_SLOW_LEN} → buy {ALLOCATION_PCT:.0%} with TP +{int(TAKE_PROFIT_PCT*100)}%, SL {int(STOP_LOSS_PCT*100)}% below)")
-    seconds = GRAN_SECONDS.get(GRANULARITY, 900)
+    log(f"Starting XRP bot (15m) | BUY: RSI<{RSI_BUY_THRESH}, SMA{MA_FAST_LEN}<SMA{MA_SLOW_LEN} | SELL: RSI>={RSI_SELL_THRESH}, SMA60(15m)>SMA60(1h)")
+    seconds_15m = GRAN_SECONDS.get(GRANULARITY, 900)
+    seconds_1h  = GRAN_SECONDS["ONE_HOUR"]
 
-    # Meta once at start (helps surface increments/quote ccy early)
+    # Meta once at start
     try:
         meta = get_product_meta(PRODUCT_ID)
-        log(f"{PRODUCT_ID} | increments price={meta['price_inc']} base={meta['base_inc']} quote={meta['quote_inc']} quote_ccy={meta['quote_ccy']}")
+        log(f"{PRODUCT_ID} | increments price={meta['price_inc']} base={meta['base_inc']} quote={meta['quote_inc']} base_ccy={meta['base_ccy']} quote_ccy={meta['quote_ccy']}")
     except Exception as e:
         log(f"Product meta error: {e}")
         return
 
     # Align to next closed 15m bar (+ small offset to ensure closure)
-    sleep_until_next_closed_bar(seconds, BAR_ALIGN_OFFSET)
+    sleep_until_next_closed_bar(seconds_15m, BAR_ALIGN_OFFSET)
 
     while not _shutting_down:
         try:
-            candles = fetch_candles(PRODUCT_ID, GRANULARITY, CANDLES_LIMIT)
-            closes = [float(c["close"]) if isinstance(c, dict) else float(c.close) for c in candles]
+            # --- Data fetch ---
+            candles_15m = fetch_candles(PRODUCT_ID, "FIFTEEN_MINUTE", max(300, CANDLES_LIMIT))
+            closes_15m = [float(c["close"]) if isinstance(c, dict) else float(c.close) for c in candles_15m]
 
-            # Decision
-            can_buy = should_buy(closes)
+            # need at least 60 1h bars for SMA60(1h)
+            candles_1h = fetch_candles(PRODUCT_ID, "ONE_HOUR", 100)
+            closes_1h  = [float(c["close"]) if isinstance(c, dict) else float(c.close) for c in candles_1h]
 
-            # Optional cooldown
-            if COOLDOWN_MIN > 0 and can_buy and _last_buy_time is not None:
+            # --- Decisions ---
+            do_sell = should_sell_cross_tf(closes_15m, closes_1h)
+            do_buy  = should_buy_15m(closes_15m)
+
+            # Optional cooldown applies only to buys
+            if COOLDOWN_MIN > 0 and do_buy and _last_buy_time is not None:
                 if datetime.now(timezone.utc) - _last_buy_time < timedelta(minutes=COOLDOWN_MIN):
-                    can_buy = False
-                    log(f"{PRODUCT_ID} | In cooldown ({COOLDOWN_MIN} min); skipping buy.")
+                    do_buy = False
+                    log(f"{PRODUCT_ID} | In cooldown ({COOLDOWN_MIN} min); skipping BUY.")
 
-            if can_buy:
-                place_market_buy_with_bracket(PRODUCT_ID, ALLOCATION_PCT, TAKE_PROFIT_PCT, STOP_LOSS_PCT)
+            # --- Actions ---
+            # Prefer handling SELL first (reduce exposure), then consider BUY
+            if do_sell:
+                place_market_sell_base_pct(PRODUCT_ID, SELL_ALLOCATION_PCT)
+
+            if do_buy:
+                place_market_buy(PRODUCT_ID, ALLOCATION_PCT)
                 _last_buy_time = datetime.now(timezone.utc)
 
         except Exception as e:
             log(f"Error: {e}")
 
-        # Sleep to next 15m closed bar (plus small offset)
-        sleep_until_next_closed_bar(seconds, BAR_ALIGN_OFFSET)
+        # Sleep to next closed 15m bar (plus small offset)
+        sleep_until_next_closed_bar(seconds_15m, BAR_ALIGN_OFFSET)
 
 if __name__ == "__main__":
     main()
