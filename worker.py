@@ -7,9 +7,10 @@ BUY when (15m):
   - SMA(60) < SMA(240)
 Executes a MARKET BUY (no bracket).
 
-SELL when (15m):
+SELL when (15m) **and profit gate**:
   - RSI(14) >= 70, and
-  - SMA(60) > SMA(240)
+  - SMA(60) > SMA(240), and
+  - Current price >= (avg_entry_price * (1 + MIN_PROFIT_PCT))
 Executes a MARKET SELL of 5% of available XRP.
 
 Logs are plain prints (suited for Railway).
@@ -28,23 +29,24 @@ from datetime import datetime, timezone, timedelta
 from coinbase.rest import RESTClient
 
 # ====== Config via env ======
-PRODUCT_ID         = os.getenv("PRODUCT_ID", "XRP-USD")
-GRANULARITY        = os.getenv("GRANULARITY", "FIFTEEN_MINUTE")
-RSI_LEN            = int(os.getenv("RSI_LEN", "14"))
-RSI_BUY_THRESH     = float(os.getenv("RSI_BUY_THRESH", "30"))
-RSI_SELL_THRESH    = float(os.getenv("RSI_SELL_THRESH", "70"))
+PRODUCT_ID          = os.getenv("PRODUCT_ID", "XRP-USD")
+GRANULARITY         = os.getenv("GRANULARITY", "FIFTEEN_MINUTE")
+RSI_LEN             = int(os.getenv("RSI_LEN", "14"))
+RSI_BUY_THRESH      = float(os.getenv("RSI_BUY_THRESH", "30"))
+RSI_SELL_THRESH     = float(os.getenv("RSI_SELL_THRESH", "70"))
 
-MA_FAST_LEN        = int(os.getenv("MA_FAST_LEN", "60"))
-MA_SLOW_LEN        = int(os.getenv("MA_SLOW_LEN", "240"))
+MA_FAST_LEN         = int(os.getenv("MA_FAST_LEN", "60"))
+MA_SLOW_LEN         = int(os.getenv("MA_SLOW_LEN", "240"))
 
-ALLOCATION_PCT     = float(os.getenv("ALLOCATION_PCT", "0.05"))        # 5% of quote balance for buys
-SELL_ALLOCATION_PCT= float(os.getenv("SELL_ALLOCATION_PCT", "0.05"))   # 5% of base balance for sells
+ALLOCATION_PCT      = float(os.getenv("ALLOCATION_PCT", "0.05"))        # 5% of quote balance for buys
+SELL_ALLOCATION_PCT = float(os.getenv("SELL_ALLOCATION_PCT", "0.05"))   # 5% of base balance for sells
+MIN_PROFIT_PCT      = float(os.getenv("MIN_PROFIT_PCT", "0.05"))        # +5% gate for sells
 
-COOLDOWN_MIN       = int(os.getenv("COOLDOWN_MINUTES", "0"))
-BAR_ALIGN_OFFSET   = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))
-LOG_PREFIX         = os.getenv("LOG_PREFIX", "[xrp-rsi-bot]")
+COOLDOWN_MIN        = int(os.getenv("COOLDOWN_MINUTES", "0"))
+BAR_ALIGN_OFFSET    = int(os.getenv("BAR_ALIGN_OFFSET_SEC", "5"))
+LOG_PREFIX          = os.getenv("LOG_PREFIX", "[xrp-rsi-bot]")
 
-CANDLES_LIMIT      = int(os.getenv("CANDLES_LIMIT", "300"))
+CANDLES_LIMIT       = int(os.getenv("CANDLES_LIMIT", "300"))
 
 GRAN_SECONDS = {
     "ONE_MINUTE": 60, "FIVE_MINUTE": 300, "FIFTEEN_MINUTE": 900, "THIRTY_MINUTE": 1800,
@@ -162,6 +164,77 @@ def fetch_candles(pid: str, granularity: str, limit: int):
     cands = sorted(cands, key=c_start)
     return [c for c in cands if c_start(c) <= last_closed_start]
 
+# --- NEW: fills & cost basis -----------------------------------------------
+def fetch_fills_for_product(pid: str, limit: int = 250):
+    """
+    Fetch recent fills for a product. We only need a reasonable window to
+    estimate average entry of the current inventory.
+    """
+    try:
+        res = client.get(
+            "/api/v3/brokerage/orders/historical/fills",
+            params={"product_id": pid, "limit": limit},
+        )
+        fills = res["fills"] if isinstance(res, dict) else getattr(res, "fills", [])
+        # Sort ascending by time if available
+        def f_time(f):
+            return _get(f, "trade_time") or _get(f, "created_at") or _get(f, "time") or ""
+        return sorted(fills, key=f_time)
+    except Exception as e:
+        log(f"{pid} | fills fetch error: {e}")
+        return []
+
+def compute_avg_cost_from_fills(fills) -> Decimal | None:
+    """
+    Moving-average inventory method:
+      - On BUY: add units and cost = price * size
+      - On SELL: remove units at current average cost
+    Returns Decimal average cost for remaining inventory, or None if unknown/zero.
+    """
+    units = Decimal("0")
+    cost  = Decimal("0")
+    for f in fills:
+        side = str(_get(f, "side", "")).upper()
+        # Coinbase may use 'size' or 'base_size' for base quantity
+        size_s  = _get(f, "size") or _get(f, "base_size") or _get_in(f, ["filled_size"]) or "0"
+        price_s = _get(f, "price") or "0"
+        try:
+            qty   = Decimal(str(size_s))
+            price = Decimal(str(price_s))
+        except Exception:
+            continue
+        if qty <= 0 or price <= 0:
+            continue
+
+        if side == "BUY":
+            units += qty
+            cost  += qty * price
+        elif side == "SELL":
+            if units <= 0:
+                # Nothing on book; skip consumption to avoid negative inventory
+                continue
+            # consume at average cost
+            avg = cost / units if units > 0 else Decimal("0")
+            consume = min(qty, units)
+            cost  -= avg * consume
+            units -= consume
+
+    if units > 0:
+        return (cost / units)
+    return None
+
+def is_min_profit_met(pid: str, min_profit_pct: float, current_price: Decimal) -> bool:
+    fills = fetch_fills_for_product(pid)
+    avg_cost = compute_avg_cost_from_fills(fills)
+    if avg_cost is None or avg_cost <= 0:
+        log(f"{pid} | Profit gate: unknown avg cost; skipping SELL for safety.")
+        return False
+    threshold = avg_cost * Decimal(str(1.0 + min_profit_pct))
+    ok = current_price >= threshold
+    log(f"{pid} | Profit gate: avg_cost={avg_cost:.6f} | price={current_price:.6f} | need≥{threshold:.6f} ? {ok}")
+    return bool(ok)
+# ---------------------------------------------------------------------------
+
 # ====== Orders ======
 def place_market_buy(pid: str, allocation_pct: float):
     meta = get_product_meta(pid)
@@ -240,7 +313,8 @@ def should_buy_15m(closes: List[float]) -> bool:
         return False
     return (r_closed < RSI_BUY_THRESH) and (fast < slow)
 
-def should_sell_15m(closes: List[float]) -> bool:
+def should_sell_15m_signal_only(closes: List[float]) -> bool:
+    """Original technical SELL signal (no PnL)."""
     r_closed = rsi(closes, RSI_LEN)
     fast = sma(closes, MA_FAST_LEN)
     slow = sma(closes, MA_SLOW_LEN)
@@ -260,7 +334,7 @@ def sleep_until_next_closed_bar(seconds_per_bar: int, offset: int = 5):
 # ====== Main loop ======
 def main():
     global _last_buy_time
-    log(f"Starting XRP bot (15m) | BUY: RSI<{RSI_BUY_THRESH}, SMA60<SMA240 | SELL: RSI>={RSI_SELL_THRESH}, SMA60>SMA240")
+    log(f"Starting XRP bot (15m) | BUY: RSI<{RSI_BUY_THRESH}, SMA60<SMA240 | SELL: RSI>={RSI_SELL_THRESH}, SMA60>SMA240 & profit≥{int(MIN_PROFIT_PCT*100)}%")
     seconds_15m = GRAN_SECONDS.get(GRANULARITY, 900)
 
     try:
@@ -276,17 +350,29 @@ def main():
         try:
             candles = fetch_candles(PRODUCT_ID, "FIFTEEN_MINUTE", CANDLES_LIMIT)
             closes = [float(c["close"]) if isinstance(c, dict) else float(c.close) for c in candles]
+            if not closes:
+                log(f"{PRODUCT_ID} | No candles; sleeping.")
+                sleep_until_next_closed_bar(seconds_15m, BAR_ALIGN_OFFSET)
+                continue
 
-            do_sell = should_sell_15m(closes)
-            do_buy  = should_buy_15m(closes)
+            do_sell_signal = should_sell_15m_signal_only(closes)
+            do_buy         = should_buy_15m(closes)
 
+            # Cooldown on buys
             if COOLDOWN_MIN > 0 and do_buy and _last_buy_time is not None:
                 if datetime.now(timezone.utc) - _last_buy_time < timedelta(minutes=COOLDOWN_MIN):
                     do_buy = False
                     log(f"{PRODUCT_ID} | In cooldown ({COOLDOWN_MIN} min); skipping BUY.")
 
-            if do_sell:
-                place_market_sell_base_pct(PRODUCT_ID, SELL_ALLOCATION_PCT)
+            # SELL with profit gate
+            if do_sell_signal:
+                current_price = Decimal(str(closes[-1]))
+                if is_min_profit_met(PRODUCT_ID, MIN_PROFIT_PCT, current_price):
+                    place_market_sell_base_pct(PRODUCT_ID, SELL_ALLOCATION_PCT)
+                else:
+                    log(f"{PRODUCT_ID} | SELL signal true but profit < {int(MIN_PROFIT_PCT*100)}%; skipping SELL.")
+
+            # BUY unchanged
             if do_buy:
                 place_market_buy(PRODUCT_ID, ALLOCATION_PCT)
                 _last_buy_time = datetime.now(timezone.utc)
